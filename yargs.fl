@@ -1,0 +1,821 @@
+/**
+ * FreeLang v2 stdlib — yargs.fl
+ *
+ * npm yargs 완전 대체 (외부 npm 0개, 네이티브 불필요)
+ * CLI 인수 파싱: --flag, -f, --flag=value, positional, command
+ *
+ * 사용 예시:
+ *   import "stdlib/yargs"
+ *
+ *   let y = createYargs(YargsConfig {
+ *     scriptName: "mycli",
+ *     usage: "$0 <command> [options]",
+ *     version: "1.0.0",
+ *     options: [],
+ *     commands: []
+ *   })
+ *
+ *   y = option(y, ArgOption {
+ *     name: "port", type: "number", description: "서버 포트",
+ *     default: "3000", required: false, alias: "p"
+ *   })
+ *   y = boolean(y, "verbose")
+ *   y = alias(y, "verbose", "v")
+ *   y = command(y, "serve", "서버 시작", "handleServe")
+ *   y = command(y, "build", "빌드", "handleBuild")
+ *
+ *   let parsed = parse(y, ["serve", "--port", "8080", "-v"])
+ *   // parsed.command  == "serve"
+ *   // parsed.args["port"]    == 8080
+ *   // parsed.args["verbose"] == true
+ *
+ *   println(showHelp(y))
+ *   println(showVersion(y))   // "mycli v1.0.0"
+ */
+
+// ============================================
+// ANSI 색상
+// ============================================
+
+let YARGS_BOLD   = "\033[1m"
+let YARGS_RESET  = "\033[0m"
+let YARGS_CYAN   = "\033[36m"
+let YARGS_YELLOW = "\033[33m"
+let YARGS_GREEN  = "\033[32m"
+let YARGS_GRAY   = "\033[90m"
+
+// ============================================
+// Struct 정의
+// ============================================
+
+/**
+ * ArgOption: 개별 CLI 옵션 정의
+ *
+ * name        - 옵션 이름 (예: "port")
+ * type        - "string" | "boolean" | "number" | "array"
+ * description - 도움말 설명
+ * default     - 기본값 (문자열로 저장)
+ * required    - 필수 여부
+ * alias       - 단일 문자 별칭 (예: "p" → -p)
+ */
+struct ArgOption {
+  name: string,
+  type: string,
+  description: string,
+  default: string,
+  required: bool,
+  alias: string
+}
+
+/**
+ * ParsedArgs: parse() 반환값
+ *
+ * command    - 감지된 서브커맨드 (없으면 "")
+ * args       - 파싱된 키-값 맵 (타입 변환 적용)
+ * positional - 플래그가 아닌 위치 인수 배열
+ * unknown    - 등록되지 않은 알 수 없는 플래그 배열
+ */
+struct ParsedArgs {
+  command: string,
+  args: map,
+  positional: array,
+  unknown: array
+}
+
+/**
+ * YargsConfig: yargs 인스턴스 설정
+ *
+ * scriptName - 스크립트 이름 (도움말 출력용)
+ * usage      - 사용법 문자열 ($0 → scriptName으로 치환)
+ * version    - 버전 문자열
+ * options    - ArgOption 배열
+ * commands   - CommandDef 배열
+ */
+struct YargsConfig {
+  scriptName: string,
+  usage: string,
+  version: string,
+  options: array,
+  commands: array
+}
+
+/**
+ * CommandDef: 서브커맨드 정의
+ */
+struct CommandDef {
+  cmd: string,
+  description: string,
+  handler: string
+}
+
+// ============================================
+// 내부 헬퍼: 옵션 탐색 / 수정
+// ============================================
+
+// 이름으로 ArgOption 인덱스 반환 (-1 = 없음)
+fn _find_opt_idx(options: array, name: string) -> int {
+  let i = 0
+  while i < arr.length(options) {
+    if options[i].name == name {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// canonical 이름으로 ArgOption 반환 (null = 없음)
+fn _find_opt(options: array, name: string) -> any {
+  let idx = _find_opt_idx(options, name)
+  if idx == -1 {
+    return null
+  }
+  return options[idx]
+}
+
+// 특정 인덱스의 옵션을 교체한 새 배열 반환
+fn _replace_opt(options: array, idx: int, newOpt: ArgOption) -> array {
+  let result = []
+  let i = 0
+  while i < arr.length(options) {
+    if i == idx {
+      result = arr.push(result, newOpt)
+    } else {
+      result = arr.push(result, options[i])
+    }
+    i = i + 1
+  }
+  return result
+}
+
+// 옵션 없으면 생성, 있으면 type만 교체
+fn _upsert_opt_type(config: YargsConfig, name: string, typeName: string) -> YargsConfig {
+  let idx = _find_opt_idx(config.options, name)
+  if idx == -1 {
+    let newOpt = ArgOption {
+      name: name,
+      type: typeName,
+      description: "",
+      default: "",
+      required: false,
+      alias: ""
+    }
+    config.options = arr.push(config.options, newOpt)
+  } else {
+    let existing = config.options[idx]
+    let updated = ArgOption {
+      name: existing.name,
+      type: typeName,
+      description: existing.description,
+      default: existing.default,
+      required: existing.required,
+      alias: existing.alias
+    }
+    config.options = _replace_opt(config.options, idx, updated)
+  }
+  return config
+}
+
+// alias 또는 이름으로 canonical 옵션명 반환
+fn _resolve_alias(options: array, nameOrAlias: string) -> string {
+  let i = 0
+  while i < arr.length(options) {
+    let opt = options[i]
+    if opt.name == nameOrAlias {
+      return opt.name
+    }
+    if opt.alias == nameOrAlias {
+      return opt.name
+    }
+    i = i + 1
+  }
+  return nameOrAlias
+}
+
+// ============================================
+// 내부 헬퍼: 플래그 감지
+// ============================================
+
+// "--foo" 또는 "--foo=bar" 감지
+// str.split("--foo", "--") → ["", "foo"] (length==2, first=="")
+fn _is_long_flag(arg: string) -> bool {
+  if !str.starts_with(arg, "--") {
+    return false
+  }
+  if str.length(arg) <= 2 {
+    return false
+  }
+  return true
+}
+
+// "-f" 감지 (단일 문자 short flag)
+// str.split("-f", "-") → ["", "f"] (length==2, first=="")
+fn _is_short_flag(arg: string) -> bool {
+  if !str.starts_with(arg, "-") {
+    return false
+  }
+  if str.starts_with(arg, "--") {
+    return false
+  }
+  if str.length(arg) != 2 {
+    return false
+  }
+  return true
+}
+
+// "--key=value" 형태 감지
+fn _is_eq_flag(arg: string) -> bool {
+  if !_is_long_flag(arg) {
+    return false
+  }
+  return str.contains(arg, "=")
+}
+
+// 어떤 종류든 플래그이면 true
+fn _is_flag(arg: string) -> bool {
+  if _is_long_flag(arg) {
+    return true
+  }
+  if _is_short_flag(arg) {
+    return true
+  }
+  return false
+}
+
+// ============================================
+// 내부 헬퍼: 값 추출 / 변환
+// ============================================
+
+// "--foo" → "foo",  "--foo=bar" → "foo=bar"
+fn _extract_long_key(arg: string) -> string {
+  // arg starts with "--", skip first 2 chars via split
+  let parts = str.split(arg, "--")
+  if arr.length(parts) >= 2 {
+    return parts[1]
+  }
+  return arg
+}
+
+// "-f" → "f"
+fn _extract_short_key(arg: string) -> string {
+  let parts = str.split(arg, "-")
+  if arr.length(parts) >= 2 {
+    return parts[1]
+  }
+  return arg
+}
+
+// "key=value" → ["key", "value"]  (= 첫 번째 = 기준 분리)
+fn _split_eq(keyval: string) -> array {
+  let eqIdx = str.index_of(keyval, "=")
+  if eqIdx < 0 {
+    return [keyval, ""]
+  }
+  let key = str.substr(keyval, 0, eqIdx)
+  let val = str.substr(keyval, eqIdx + 1, str.length(keyval) - eqIdx - 1)
+  return [key, val]
+}
+
+// 타입에 따라 raw 문자열 값을 변환
+fn _coerce(raw: string, typeName: string) -> any {
+  if typeName == "boolean" {
+    if raw == "false" || raw == "0" || raw == "" {
+      return false
+    }
+    return true
+  }
+  if typeName == "number" {
+    return int(raw)
+  }
+  // "string" | "array" → 문자열 그대로
+  return raw
+}
+
+// ============================================
+// createYargs — 기본값 보완
+// ============================================
+
+fn createYargs(config: YargsConfig) -> YargsConfig {
+  let name    = config.scriptName
+  let usage   = config.usage
+  let version = config.version
+  let opts    = config.options
+  let cmds    = config.commands
+
+  if name == null || name == "" {
+    name = "app"
+  }
+  if usage == null || usage == "" {
+    usage = "$0 [options]"
+  }
+  if version == null || version == "" {
+    version = "0.0.0"
+  }
+  if opts == null {
+    opts = []
+  }
+  if cmds == null {
+    cmds = []
+  }
+
+  return YargsConfig {
+    scriptName: name,
+    usage:      usage,
+    version:    version,
+    options:    opts,
+    commands:   cmds
+  }
+}
+
+// ============================================
+// option — ArgOption 추가/교체
+// ============================================
+
+fn option(config: YargsConfig, opt: ArgOption) -> YargsConfig {
+  let idx = _find_opt_idx(config.options, opt.name)
+  if idx == -1 {
+    config.options = arr.push(config.options, opt)
+  } else {
+    config.options = _replace_opt(config.options, idx, opt)
+  }
+  return config
+}
+
+// ============================================
+// command — 서브커맨드 등록
+// ============================================
+
+fn command(config: YargsConfig, cmd: string, desc: string, handler: string) -> YargsConfig {
+  let newCmd = CommandDef {
+    cmd:         cmd,
+    description: desc,
+    handler:     handler
+  }
+  config.commands = arr.push(config.commands, newCmd)
+  return config
+}
+
+// ============================================
+// alias — 옵션에 단일 문자 별칭 지정
+// ============================================
+
+fn alias(config: YargsConfig, key: string, alias_char: string) -> YargsConfig {
+  let idx = _find_opt_idx(config.options, key)
+  if idx == -1 {
+    let newOpt = ArgOption {
+      name:        key,
+      type:        "string",
+      description: "",
+      default:     "",
+      required:    false,
+      alias:       alias_char
+    }
+    config.options = arr.push(config.options, newOpt)
+  } else {
+    let existing = config.options[idx]
+    let updated = ArgOption {
+      name:        existing.name,
+      type:        existing.type,
+      description: existing.description,
+      default:     existing.default,
+      required:    existing.required,
+      alias:       alias_char
+    }
+    config.options = _replace_opt(config.options, idx, updated)
+  }
+  return config
+}
+
+// ============================================
+// 타입 지정 함수 (builder chain)
+// ============================================
+
+fn boolean(config: YargsConfig, key: string) -> YargsConfig {
+  return _upsert_opt_type(config, key, "boolean")
+}
+
+fn string(config: YargsConfig, key: string) -> YargsConfig {
+  return _upsert_opt_type(config, key, "string")
+}
+
+fn number(config: YargsConfig, key: string) -> YargsConfig {
+  return _upsert_opt_type(config, key, "number")
+}
+
+fn array(config: YargsConfig, key: string) -> YargsConfig {
+  return _upsert_opt_type(config, key, "array")
+}
+
+// ============================================
+// required — 필수 옵션 지정
+// ============================================
+
+fn required(config: YargsConfig, key: string) -> YargsConfig {
+  let idx = _find_opt_idx(config.options, key)
+  if idx == -1 {
+    let newOpt = ArgOption {
+      name:        key,
+      type:        "string",
+      description: "",
+      default:     "",
+      required:    true,
+      alias:       ""
+    }
+    config.options = arr.push(config.options, newOpt)
+  } else {
+    let existing = config.options[idx]
+    let updated = ArgOption {
+      name:        existing.name,
+      type:        existing.type,
+      description: existing.description,
+      default:     existing.default,
+      required:    true,
+      alias:       existing.alias
+    }
+    config.options = _replace_opt(config.options, idx, updated)
+  }
+  return config
+}
+
+// ============================================
+// positional — 위치 인수 스펙 추가
+// opts 맵 키: "type", "description", "default", "required"
+// ============================================
+
+fn positional(config: YargsConfig, name: string, opts: map) -> YargsConfig {
+  let ptype    = opts["type"]        || "string"
+  let pdesc    = opts["description"] || ""
+  let pdefault = opts["default"]     || ""
+  let preq     = opts["required"]    || false
+
+  let posOpt = ArgOption {
+    name:        "_pos_" + name,
+    type:        ptype,
+    description: pdesc,
+    default:     pdefault,
+    required:    preq,
+    alias:       name            // alias 필드에 원본 이름 보관
+  }
+  config.options = arr.push(config.options, posOpt)
+  return config
+}
+
+// ============================================
+// parse — 메인 파싱 함수
+// ============================================
+
+fn parse(config: YargsConfig, argv: array) -> ParsedArgs {
+  let result = ParsedArgs {
+    command:    "",
+    args:       {},
+    positional: [],
+    unknown:    []
+  }
+
+  let options  = config.options  || []
+  let commands = config.commands || []
+  let len      = arr.length(argv)
+  let i        = 0
+
+  while i < len {
+    let arg = argv[i]
+
+    // ── 1. --key=value ──────────────────────────────────────
+    if _is_eq_flag(arg) {
+      let raw     = _extract_long_key(arg)   // "key=value"
+      let kv      = _split_eq(raw)
+      let key     = kv[0]
+      let val     = kv[1]
+
+      // --no-key=... → boolean false
+      if str.starts_with(key, "no-") {
+        key = str.substr(key, 3, str.length(key) - 3)
+        val = "false"
+      }
+
+      let canonical = _resolve_alias(options, key)
+      let opt       = _find_opt(options, canonical)
+      let typeName  = "string"
+      if opt != null {
+        typeName = opt.type
+      } else {
+        result.unknown = arr.push(result.unknown, arg)
+      }
+
+      if typeName == "array" {
+        let cur = result.args[canonical]
+        if cur == null {
+          result.args[canonical] = [val]
+        } else {
+          result.args[canonical] = arr.push(cur, val)
+        }
+      } else {
+        result.args[canonical] = _coerce(val, typeName)
+      }
+
+      i = i + 1
+
+    // ── 2. --key (long flag) ────────────────────────────────
+    } else if _is_long_flag(arg) {
+      let key = _extract_long_key(arg)
+
+      // --no-key → boolean false
+      if str.starts_with(key, "no-") {
+        let actual = str.substr(key, 3, str.length(key) - 3)
+        let canonical = _resolve_alias(options, actual)
+        result.args[canonical] = false
+        i = i + 1
+
+      } else {
+        let canonical = _resolve_alias(options, key)
+        let opt       = _find_opt(options, canonical)
+        let typeName  = "string"
+        if opt != null {
+          typeName = opt.type
+        }
+
+        if typeName == "boolean" {
+          // boolean 플래그: 값 없이 true
+          result.args[canonical] = true
+          i = i + 1
+        } else {
+          // 다음 인수를 값으로 사용
+          if i + 1 < len {
+            let nextArg = argv[i + 1]
+            if !_is_flag(nextArg) {
+              if typeName == "array" {
+                let cur = result.args[canonical]
+                if cur == null {
+                  result.args[canonical] = [nextArg]
+                } else {
+                  result.args[canonical] = arr.push(cur, nextArg)
+                }
+              } else {
+                result.args[canonical] = _coerce(nextArg, typeName)
+              }
+              i = i + 2
+            } else {
+              // 다음도 플래그 → string 옵션에 true 저장
+              result.args[canonical] = true
+              if opt == null {
+                result.unknown = arr.push(result.unknown, arg)
+              }
+              i = i + 1
+            }
+          } else {
+            // 마지막 인수 → true
+            result.args[canonical] = true
+            if opt == null {
+              result.unknown = arr.push(result.unknown, arg)
+            }
+            i = i + 1
+          }
+        }
+      }
+
+    // ── 3. -f (short flag / alias) ──────────────────────────
+    } else if _is_short_flag(arg) {
+      let alias_char = _extract_short_key(arg)
+      let canonical  = _resolve_alias(options, alias_char)
+      let opt        = _find_opt(options, canonical)
+      let typeName   = "string"
+      if opt != null {
+        typeName = opt.type
+      } else {
+        result.unknown = arr.push(result.unknown, arg)
+      }
+
+      if typeName == "boolean" {
+        result.args[canonical] = true
+        i = i + 1
+      } else {
+        if i + 1 < len {
+          let nextArg = argv[i + 1]
+          if !_is_flag(nextArg) {
+            result.args[canonical] = _coerce(nextArg, typeName)
+            i = i + 2
+          } else {
+            result.args[canonical] = true
+            i = i + 1
+          }
+        } else {
+          result.args[canonical] = true
+          i = i + 1
+        }
+      }
+
+    // ── 4. 위치 인수 / 서브커맨드 ──────────────────────────
+    } else {
+      // 첫 비-플래그 인수가 커맨드인지 확인
+      if result.command == "" {
+        let ci  = 0
+        let hit = false
+        while ci < arr.length(commands) {
+          if commands[ci].cmd == arg {
+            result.command = arg
+            hit = true
+          }
+          ci = ci + 1
+        }
+        if !hit {
+          result.positional = arr.push(result.positional, arg)
+        }
+      } else {
+        result.positional = arr.push(result.positional, arg)
+      }
+      i = i + 1
+    }
+  }
+
+  // ── 기본값 / boolean 초기화 적용 ────────────────────────
+  let di = 0
+  while di < arr.length(options) {
+    let opt = options[di]
+
+    // boolean 플래그: 미설정이면 false
+    if opt.type == "boolean" {
+      if result.args[opt.name] == null {
+        result.args[opt.name] = false
+      }
+    }
+
+    // default 값 적용
+    if opt.default != "" {
+      if result.args[opt.name] == null {
+        result.args[opt.name] = _coerce(opt.default, opt.type)
+      }
+    }
+
+    di = di + 1
+  }
+
+  return result
+}
+
+// ============================================
+// showHelp — 도움말 문자열 생성
+// ============================================
+
+fn showHelp(config: YargsConfig) -> string {
+  let usageStr = str.replace_all(config.usage, "$0", config.scriptName)
+  let out = ""
+
+  out = out + YARGS_BOLD + "사용법:" + YARGS_RESET + " " + usageStr + "\n"
+
+  // 커맨드 목록
+  if arr.length(config.commands) > 0 {
+    out = out + "\n" + YARGS_BOLD + "커맨드:" + YARGS_RESET + "\n"
+    let ci = 0
+    while ci < arr.length(config.commands) {
+      let cmdDef = config.commands[ci]
+      out = out + "  " + YARGS_CYAN + cmdDef.cmd + YARGS_RESET
+      out = out + "  " + cmdDef.description + "\n"
+      ci = ci + 1
+    }
+  }
+
+  // 옵션 목록 (_pos_ 접두사 옵션 제외)
+  let hasOpts = false
+  let oi = 0
+  while oi < arr.length(config.options) {
+    if !str.starts_with(config.options[oi].name, "_pos_") {
+      hasOpts = true
+    }
+    oi = oi + 1
+  }
+
+  if hasOpts {
+    out = out + "\n" + YARGS_BOLD + "옵션:" + YARGS_RESET + "\n"
+    let oi2 = 0
+    while oi2 < arr.length(config.options) {
+      let opt = config.options[oi2]
+      if !str.starts_with(opt.name, "_pos_") {
+        let flag = "--" + opt.name
+        if opt.alias != "" {
+          flag = "-" + opt.alias + ", " + flag
+        }
+        let typeTag = YARGS_YELLOW + "[" + opt.type + "]" + YARGS_RESET
+        let reqTag  = ""
+        if opt.required {
+          reqTag = YARGS_GREEN + " (필수)" + YARGS_RESET
+        }
+        let defTag = ""
+        if opt.default != "" {
+          defTag = YARGS_GRAY + " [기본: " + opt.default + "]" + YARGS_RESET
+        }
+        out = out + "  " + flag + "  " + opt.description
+        out = out + " " + typeTag + reqTag + defTag + "\n"
+      }
+      oi2 = oi2 + 1
+    }
+    // 자동 추가: --help, --version
+    out = out + "  -h, --help     " + YARGS_GRAY + "도움말 표시" + YARGS_RESET + "\n"
+    out = out + "      --version  " + YARGS_GRAY + "버전 표시"   + YARGS_RESET + "\n"
+  }
+
+  return out
+}
+
+// ============================================
+// showVersion — 버전 문자열 반환
+// ============================================
+
+fn showVersion(config: YargsConfig) -> string {
+  return config.scriptName + " v" + config.version
+}
+
+// ============================================
+// 편의 함수
+// ============================================
+
+// scriptName만 지정해 YargsConfig 생성
+fn createSimple(scriptName: string) -> YargsConfig {
+  return createYargs(YargsConfig {
+    scriptName: scriptName,
+    usage:      "$0 [options]",
+    version:    "1.0.0",
+    options:    [],
+    commands:   []
+  })
+}
+
+// --help 또는 -h 감지
+fn isHelpRequested(parsed: ParsedArgs) -> bool {
+  if parsed.args["help"] == true {
+    return true
+  }
+  return false
+}
+
+// --version 감지
+fn isVersionRequested(parsed: ParsedArgs) -> bool {
+  if parsed.args["version"] == true {
+    return true
+  }
+  return false
+}
+
+// 누락된 required 옵션 이름 배열 반환
+fn getMissingRequired(config: YargsConfig, parsed: ParsedArgs) -> array {
+  let missing = []
+  let i = 0
+  while i < arr.length(config.options) {
+    let opt = config.options[i]
+    if opt.required {
+      if parsed.args[opt.name] == null {
+        missing = arr.push(missing, opt.name)
+      }
+    }
+    i = i + 1
+  }
+  return missing
+}
+
+// 파싱 결과에서 특정 키의 값 반환 (없으면 fallback)
+fn getArg(parsed: ParsedArgs, key: string, fallback: any) -> any {
+  let val = parsed.args[key]
+  if val == null {
+    return fallback
+  }
+  return val
+}
+
+// ============================================
+// Export
+// ============================================
+
+export {
+  // Struct
+  ArgOption,
+  ParsedArgs,
+  YargsConfig,
+  CommandDef,
+
+  // 초기화
+  createYargs,
+  createSimple,
+
+  // Builder API
+  option,
+  command,
+  alias,
+  boolean,
+  string,
+  number,
+  array,
+  required,
+  positional,
+
+  // 파싱
+  parse,
+
+  // 출력
+  showHelp,
+  showVersion,
+
+  // 유틸
+  isHelpRequested,
+  isVersionRequested,
+  getMissingRequired,
+  getArg
+}
